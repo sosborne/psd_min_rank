@@ -4,6 +4,11 @@ include 'sage/ext/interrupt.pxi'
 
 """
 Fast computation of zero forcing sets
+
+TODO: Make a wavefront function for looped vertices:
+  * dying alone vertices are cost zero
+  * "active" vertices are either filled *or* looped
+  * undetermined vertices act as normal zero forcing.
 """
 
 #######################################################################
@@ -26,7 +31,6 @@ Fast computation of zero forcing sets
 #######################################################################
 
 
-include "sage/misc/bitset_pxd.pxi"
 include "sage/misc/bitset.pxi"
 from sage.misc.bitset cimport FrozenBitset, Bitset
 
@@ -82,12 +86,12 @@ def zero_forcing_set_wavefront(matrix):
 
     INPUT:
 
-    a graph
+    a graph or a matrix
 
 
     OUTPUT:
 
-    A zero forcing set as a frozen set
+    The zero forcing number, A zero forcing set as a frozen set, and the number of closures (memory) that were stored.
     
     
     EXAMPLE::
@@ -127,10 +131,10 @@ def zero_forcing_set_wavefront(matrix):
     
     initial_Bitset = Bitset(None, capacity=num_vertices)
     unfilled_Bitset = FrozenBitset(None, capacity=num_vertices)
-    unfilled_set = unfilled_Bitset._bitset    
+    unfilled_set = &unfilled_Bitset._bitset[0]
     # Set unfilled_set to include all vertices
     bitset_complement(unfilled_set, unfilled_set)
-    closures[unfilled_Bitset] = initial_Bitset    
+    closures[unfilled_Bitset] = initial_Bitset
 
     bitset_init(unfilled_neighbors, num_vertices)
 
@@ -138,8 +142,8 @@ def zero_forcing_set_wavefront(matrix):
     for budget in range(minimum_degree,num_vertices+1):
         #print "current budget: ", budget, " Current closures: ", len(closures)
         for unfilled_Bitset, initial_Bitset in closures.items():
-            initial_set = initial_Bitset._bitset
-            unfilled_set = unfilled_Bitset._bitset
+            initial_set = &initial_Bitset._bitset[0]
+            unfilled_set = &unfilled_Bitset._bitset[0]
             can_afford = budget - bitset_len(initial_set)
             #print "from here, can afford cost of: ", can_afford
 
@@ -172,8 +176,8 @@ def zero_forcing_set_wavefront(matrix):
                     #print "  adding closure ", num_current_closures + num_closures_to_add
                     closure_to_add_initial_Bitset = Bitset(None, capacity=num_vertices)
                     closure_to_add_unfilled_Bitset = FrozenBitset(None, capacity=num_vertices)
-                    closure_to_add_initial = closure_to_add_initial_Bitset._bitset
-                    closure_to_add_unfilled = closure_to_add_unfilled_Bitset._bitset
+                    closure_to_add_initial = &closure_to_add_initial_Bitset._bitset[0]
+                    closure_to_add_unfilled = &closure_to_add_unfilled_Bitset._bitset[0]
 
                     bitset_copy(closure_to_add_initial, initial_set)
                     

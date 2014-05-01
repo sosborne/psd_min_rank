@@ -1,15 +1,8 @@
 # -*- coding: utf-8 -*-
-"""
-Zero forcing
-
-This module implements zero forcing using fast bitsets and a
-brute-force approach to trying various bitsets.
-"""
-
 
 #######################################################################
 #
-# Copyright (C) 2008 Steve Butler, Jason Grout.
+# Copyright (C) 2011 Steve Butler, Jason Grout.
 #
 #
 # This program is free software: you can redistribute it and/or modify
@@ -28,12 +21,12 @@ brute-force approach to trying various bitsets.
 
 
 try:
-   from Zq_c import can_push, neighbors_connected_components
+    from Zq_c import push_zeros, push_zeros_looped, neighbors_connected_components
 except ImportError:
-   # assume everything is in the global space
-   # this happens when, for example, someone "load"s the right files
-   # in the Sage notebook
-   pass
+    # assume everything is in the global space
+    # this happens when, for example, someone "load"s the right files
+    # in the Sage notebook
+    pass
 
 from itertools import combinations,chain
 def subsets(s,r=None):
@@ -83,7 +76,7 @@ def zero_forcing_sets(G=None,neighbors=None):
             return zero_forcing_number, lastZ, L
 
 
-def Z_pythonBitset(G,q,zfs_sets=None):
+def Z_pythonBitsetold(G,q,zfs_sets=None):
     """
     Assumes the graph has vertices 0,1,2,...,n-1
     """
@@ -113,6 +106,7 @@ def Z_pythonBitset(G,q,zfs_sets=None):
 
     #print L
     debug=False
+    # TODO: Should this be range(n-2, -1, -1) (so that sizeZ could be 1!)
     for sizeZ in range(n-2,0,-1):
         #if debug: print "Exploring size",sizeZ
         for Z in subsets(V, sizeZ):
@@ -152,6 +146,8 @@ def Z_pythonBitset(G,q,zfs_sets=None):
             return zero_forcing_number, set(reverse_map[i] for i in lastZ)
 
 
+
+
 def Zq_inertia_lower_bound(G,verbose=False):
     """
     Run the Zq iteratively until we get a good lower bound.
@@ -169,7 +165,7 @@ def Zq_inertia_lower_bound(G,verbose=False):
     for q in range(n//2+1): # ceil(n/2)
         if verbose: print "calculating Z%s"%q
         if compute_Zq is True:
-            Zq=Z_pythonBitset(G,q,zfs_sets=zfs_sets)[0]
+            Zq=Zq_bitset(G,q,zfs_sets=zfs_sets)[0]
         else:
             Zq=zero_forcing_number
         if Zq==zero_forcing_number:
@@ -190,8 +186,293 @@ def Zq_inertia_lower_bound(G,verbose=False):
         curr_x,curr_y=new_x,new_y
     return not_in_inertia
 
+
+# if in library mode, we need to import this.
+# if it is just included in a sage notebook, then it is in the global namespace
+# so we try importing it if we can.  If we can't import it, then just trust that
+# everything is in the global namespace.
+try:
+    from zero_forcing_wavefront import zero_forcing_set_wavefront
+    from inertia import InertiaSet
+    from Zq_c import push_zeros
+except ImportError:
+    pass
+
+
+def Zq_inertia_lower_bound(G, zero_forcing_function=None, verbose=False):
+    """
+    Run the Zq iteratively until we get a good lower bound.
+    (n-q-Z(G,q)-1,q) and (q,n-q-Z(G,q)-1)is not in the inertia set of G
+    By the Southwest lemma, everything south and west of the point is not in the inertia
+    
+    G is assumed to be connected
+    """
+    global Zq_compute
+    if zero_forcing_function is None:
+        zero_forcing_function=Zq_compute
+    G=G.relabel(inplace=False)
+    n=G.order()
+    I = InertiaSet([(G.order(), G.order())])
+    zero_forcing_number=zero_forcing_function(G,n)
+    compute_Zq=True
+    for q in range(n//2+1): # ceil(n/2)
+        if verbose: print "calculating Z%s"%q
+        if compute_Zq is True:
+            Zq=zero_forcing_function(G,q)
+        else:
+            Zq=zero_forcing_number
+        if Zq==zero_forcing_number:
+            compute_Zq=False
+        if n-q-Zq==q:
+            I|=[(n-q-Zq,q)]
+        if n-q-Zq<=q:
+            break
+        I|=[(n-q-Zq,q)]
+    return I
+
+
+
+from sage.all import points
+def plot_inertia_lower_bound(g, Zq_args={}):
+    n=g.order()
+    return plot(Zq_inertia_lower_bound(g, **Zq_args),
+                pointsize=40,gridlines=True,
+                ticks=[range(n+1),range(n+1)],
+                aspect_ratio=1)+line([(0,n),(n,0)],linestyle=':')
+
+
+
+#################################################################
+######  Better Algorithm
+#################################################################
+
+
+def Zq_graph_info(G):
+    """
+    Extract (and cache) necessary graph information for the Zq_bitset function.
+
+    We've separated this out so that this busy work can be easily cached.
+    """
+    G=G.copy()
+
+    relabel=G.relabel(return_map=True)
+    reverse_map=dict( (v,k) for k,v in relabel.items())
+    R=lambda x: reverse_map[x]
+
+    n=G.order()
+    V=FrozenBitset(G.vertices(),capacity=n)
+    neighbors=[FrozenBitset(G.neighbors(i),capacity=n) for i in range(n)]
+    return reverse_map, R, n, V, neighbors
+
+def Zq_bitset(G,q, push_zeros, push_zeros_kwargs=dict(), return_track=False):
+    """
+    Calculate Zq, where you can have arbitrary color rules encoded in a push_zeros function.
+
+    INPUT:
+    :param G: a simple undirected graph
+    :param q: the :math:`q` for the algorithm
+    :param push_zeros: a function with the signature ``push_zeros(neighbors, subgraph, filled_set, return_bitset=False, **kwargs)``, where the extra ``kwargs`` are another parameter.
+    :param push_zeros_kwargs: extra arguments to the push_zeros function
+    :param return_track: (bool) whether to return a sequence of actions that obtain the Zq value.
+    """
+    # We aggressively cache the graph information
+    if not isinstance(G, tuple):
+        G = Zq_graph_info(G)
+    reverse_map, R, n, V, neighbors = G
+    # TODO: Why is this important?
+    if n<2:
+        raise ValueError("G needs to have 2 or more vertices")
+    cost={V: 0}
+    if return_track: 
+        track={V:'done'}
+    
+    #print L
+    debug=True
+    for sizeZ in range(n-1,-1,-1):
+        for Z in subsets(V, sizeZ):
+            Z=FrozenBitset(Z,capacity=n)
+            if push_zeros(neighbors, subgraph=V, filled_set=Z, return_bitset=False,
+                          **push_zeros_kwargs):
+                #print "can push, so skipping", Z
+                continue
+            b=n
+            c=n
+            cost[Z]=n
+            if return_track:
+                track[Z]='sentinal'
+            H=neighbors_connected_components(neighbors, V.difference(Z))
+            #if debug: print "H",H
+            #if debug: print "looping through subsets:",list(subsets(H,q+1))
+            for J in subsets(H,q+1):
+                #if debug: print "Hand to opponent: ",J
+                bb=-1
+                for K in subsets(J):
+                    if len(K)==0:
+                        continue # ignore the empty set
+                        
+                    subgraph=Bitset(Z,capacity=n)
+                    for s in K:
+                        subgraph.update(FrozenBitset(s))
+                    closed_Z=push_zeros(neighbors, subgraph=subgraph, 
+                                filled_set=Z, return_bitset=True, **push_zeros_kwargs)
+                    closed_Z=push_zeros(neighbors, subgraph=V, 
+                                filled_set=closed_Z, return_bitset=True, **push_zeros_kwargs)
+                    if cost[closed_Z]>bb:
+                        bb=cost[closed_Z] #max(bb,cost[closed_Z])
+                        if return_track:
+                            bb_set=(J,K,closed_Z)
+                if bb<b:
+                    b=bb #min(b,bb)
+                    if return_track:
+                        b_set=bb_set
+            for v in V-Z:
+                closed_Z=Z.union(FrozenBitset([v],capacity=n))
+                closed_Z=push_zeros(neighbors, subgraph=V, filled_set=closed_Z,
+                                    return_bitset=True, **push_zeros_kwargs)
+                if cost[closed_Z]+1<c:
+                    c=cost[closed_Z]+1 #min(c, cost[closed_Z]+1)
+                    if return_track:
+                        c_vertex=v
+                        c_closed=closed_Z
+            if b<c:
+                cost[Z]=b #min(b,c)
+                if return_track:
+                    track[Z]=('set: hand %s to adversary; adversary hands back %s, push to get %s'%([map(R,i) for i in b_set[0]], [map(R,i) for i in b_set[1]], map(R,b_set[2])), b_set[2])
+            else:
+                cost[Z]=c #min(b,c)
+                if return_track:
+                    track[Z]=('spend vertex %s, get %s'%(reverse_map[c_vertex],map(R,c_closed)), c_closed)
+    if return_track:
+        trail=''
+        Z=FrozenBitset([], capacity=n)
+        while Z!=FrozenBitset(V,capacity=n):
+            trail+='%s\n'%(track[Z],)
+            Z=track[Z][1]
+        return cost[push_zeros(neighbors, subgraph=V, 
+                               filled_set=FrozenBitset([], capacity=n), 
+                               return_bitset=True, **push_zeros_kwargs)], trail
+    else:
+        return cost[push_zeros(neighbors, subgraph=V, 
+                               filled_set=FrozenBitset([], capacity=n), 
+                               return_bitset=True, **push_zeros_kwargs)]
+
+
+
+def Zqhat_recurse(G,q,looped,unlooped, BEST_LOWER_BOUND, BEST_LOOPS, CACHE, G_info):
+    """
+    We construct a tree of possibilities of looping and unlooping
+    vertices, where the root of the tree is all vertices unspecified,
+    and the leaves are all possibilities of specifying loops and
+    unloops.  Each node has two children, corresponding to making a
+    fixed vertex looped or unlooped.
+
+    This function returns the maximum Zqhat of all leaves.  We know
+    that Zqhat decreases as we go down from the root (a looped/unlooped vertex has more
+    options to force than an unspecified vertex), so if we ever
+    find a leaf that is the same value as a node in the tree, we don't
+    have to explore that subtree any more.
+
+    BEST_LOWER_BOUND holds the global maximum lower bound for Zqhat.  If a node's Zq
+    is lower than this, then we have no hope of increasing the best lower bound, so we
+    shortcut return.
+
+    BEST_LOOPS is a list (in which case we will fill it with the loopsets that give us the lower bound)
+    or it is False, in which case we can shortcut operations even more to run faster.
+
+    """
+    n=G.order()
+    unmarked = Bitset(range(n))-looped-unlooped
+
+    canonical_label = (G.canonical_label(partition=[list(looped), list(unlooped), list(unmarked)]).graph6_string(), len(looped), len(unlooped))
+    if canonical_label in CACHE:
+        # already investigated this node (up to permutation respecting loops)
+        #print "skipping looped: %s, unlooped %s"%(looped, unlooped)
+        return
+    else:
+        CACHE.add(canonical_label)
+
+    # Zq = how many vertices is Black forced to use
+    Zq=Zq_bitset(G_info,q,push_zeros=push_zeros_looped, 
+                 push_zeros_kwargs=dict(looped=looped,unlooped=unlooped))
+
+    if Zq<BEST_LOWER_BOUND[0]:
+        # Some leaf in another branch of the tree is already doing better than this entire branch
+        # could possibly do, so prune here.
+        return
+    elif BEST_LOOPS is False and Zq==BEST_LOWER_BOUND[0]:
+        # if we don't care about calculating the best loops, then we can shortcut even equality
+        # since we only care about improving the bound
+        return
+
+    if len(unmarked)==0:
+        # we are at a leaf and ready to evaluate
+        # Furthermore, because of the above, we know we have a better (or equal if BEST_LOOPS is a list)
+        # BEST_LOWER_BOUND than we have found so far, so store it.
+        if BEST_LOOPS is not False:
+            if Zq == BEST_LOWER_BOUND[0]:
+                BEST_LOOPS.append(dict(looped=looped, unlooped=unlooped))
+            else:
+                BEST_LOWER_BOUND[0]=Zq
+                BEST_LOOPS[:] = [dict(looped=looped, unlooped=unlooped)]
+        else:
+            # We must have a better bound
+            BEST_LOWER_BOUND[0]=Zq
+        return
+    else:
+        # we need to choose an unmarked vertex to go further down the branches
+        v=unmarked.pop()
+
+        new_looped=looped.union(FrozenBitset([v],capacity=n))
+        Zqhat_recurse(G,q,looped=new_looped, unlooped=unlooped,
+                      BEST_LOWER_BOUND=BEST_LOWER_BOUND, BEST_LOOPS=BEST_LOOPS, CACHE=CACHE, G_info=G_info)
+
+
+        if BEST_LOOPS is False and Zq<=BEST_LOWER_BOUND[0]:
+            # We've done as good as we possibly can on this branch,
+            # and we don't care about exploring everything, so shortcut and return
+            return
+
+        new_unlooped=unlooped.union(FrozenBitset([v],capacity=n))
+        Zqhat_recurse(G,q,looped=looped,unlooped=new_unlooped,
+                      BEST_LOWER_BOUND=BEST_LOWER_BOUND, BEST_LOOPS=BEST_LOOPS, CACHE=CACHE, G_info=G_info)
+        return
+
+def Zqhat(G, q, return_loops=False):
+    n=G.order()
+    full_set=FrozenBitset(range(n))
+    empty_set=FrozenBitset([],capacity=n)
+    # calculate Zqhat for a few loopsets to get a trivial lower bound for Zqhat
+    # BEST_* are mutable lists so that the recursive calls can change these
+    # variables.  In a sense, this is a global variable for the Zqhat
+    # recursive calls.
+    BEST_LOWER_BOUND = [0]
+    if return_loops:
+	BEST_LOOPS = []
+    else:
+        BEST_LOOPS = False
+    G_info = Zq_graph_info(G)
+    for loopset in [dict(looped=full_set,unlooped=empty_set), dict(looped=empty_set,unlooped=full_set)]:
+        Zq = Zq_bitset(G_info,q,push_zeros=push_zeros_looped,
+                       push_zeros_kwargs=loopset)
+        if Zq < BEST_LOWER_BOUND[0]:
+            BEST_LOWER_BOUND[0] = Zq
+            if BEST_LOOPS is not False:
+                BEST_LOOPS[:] = [loopset]
+        elif BEST_LOOPS is not False and Zq == BEST_LOWER_BOUND[0]:
+            BEST_LOOPS.append(loopset)
+
+    Zqhat_recurse(G, q, FrozenBitset([], capacity=n),
+                  FrozenBitset([], capacity=n), BEST_LOWER_BOUND=BEST_LOWER_BOUND, BEST_LOOPS=BEST_LOOPS, CACHE=set(), G_info=G_info)
+    if return_loops:
+        return BEST_LOWER_BOUND[0], BEST_LOOPS
+    else:
+        return BEST_LOWER_BOUND[0]
+
+def Zq_compute(G,q):
+    return Zq_bitset(G,q,push_zeros=push_zeros)
+
 def Zplus(G):
-   return Z_pythonBitset(G,q=0)
+   return Zq_compute(G,0)
 
 from sage.all import Graph, graphs
 G=Graph()
@@ -200,167 +481,21 @@ G.add_edges([[1,2],[2,3],[3,4],[4,5],[5,6],[6,1],[1,4],[2,5],[3,6],[7,1],[7,2],[
 G2=graphs.CompleteGraph(4)
 G2.subdivide_edges(G2.edges(),1)
 
-from sage.all import points
-def plot_inertia_lower_bound(g):
-   return points(list(Zq_inertia_lower_bound(g)),
-                pointsize=40,gridlines=True,
-                ticks=[range(g.order()),range(g.order())],
-                aspect_ratio=1)
+
+def check_trees(start,end):
+    for i in range(start,end):
+        print "working on %s vertices"%i
+        list(check_tree(list(graphs.trees(i))))
+
+@parallel            
+def check_tree(g):
+    if not inertia_set(g,f)==Zq_inertia_lower_bound(g):
+        if not inertia_set(g,f)==Zq_inertia_lower_bound(g, zero_forcing_function=Zqhat):
+            print '\n%s'%g.graph6_string()
+    return None
+    
 
 """
 import cProfile as cp
 cp.run('Z_pythonBitset(graphs.HeawoodGraph(),q=2)',sort='time')
 """
-
-###################################################################
-##   OLD CODE SUPERSEDED BY THE ABOVE CODE ########################
-###################################################################
-
-old_code='''
-
-def playzerosgame(graph, initial_set=[], one_step=False):
-   """
-   Apply the color-change rule to a given graph given an optional
-   initial set.
-
-   :param graph: the graph on which to apply the rule
-   :param initial_set: the set of "zero" (black) vertices in the graph
-   
-   :return: the list of zero (black) vertices in the resulting derived
-        coloring
-
-   EXAMPLES:: 
-
-        sage: from sage.graphs.minrank import zerosgame
-        sage: zerosgame(graphs.PathGraph(5))
-        []
-        sage: zerosgame(graphs.PathGraph(5),[0])
-        [0, 1, 2, 3, 4]
-   """
-   new_zero_set=set(initial_set)
-   zero_set=set([])
-   zero_neighbors={}
-   active_zero_set = set([])
-   inactive_zero_set = set([])
-   another_run=True
-   while another_run:
-       another_run=False
-       # Add the new zero vertices
-       zero_set.update(new_zero_set)
-       active_zero_set.update(new_zero_set)
-       active_zero_set.difference_update(inactive_zero_set)
-       zero_neighbors.update([[i, 
-                   set(graph.neighbors(i)).difference(zero_set)] 
-                              for i in new_zero_set])
-       # Find the next set of zero vertices
-       new_zero_set.clear()
-       inactive_zero_set.clear()
-       for v in active_zero_set:
-           zero_neighbors[v].difference_update(zero_set)
-           if len(zero_neighbors[v])==1:
-               new_zero_set.add(zero_neighbors[v].pop())
-               inactive_zero_set.add(v)
-               another_run=True
-               if one_step is True:
-                   return zero_set.union(new_zero_set)
-       if one_step is True and another_run is False:
-           return zero_set
-   return list(zero_set)
-
-def Z_python(G,q,zfs_sets=None):
-    n=G.order()
-    V=set(G.vertices())
-    if not G.is_connected():
-        raise ValueError("G needs to be connected")
-    if n<2:
-        raise ValueError("G needs to have 2 or more vertices")
-       
-    if zfs_sets is None:
-        zfs_sets=zero_forcing_sets(G)
-    zero_forcing_number, lastZ,L=zfs_sets
-
-    #print L
-    debug=False
-    for sizeZ in range(n-2,0,-1):
-        #if debug: print "Exploring size",sizeZ
-        for Z in subsets(V, sizeZ):
-            Z=frozenset(Z)
-            if Z not in L:
-                H=[tuple(i) for i in G.subgraph(V.difference(Z)).connected_components()]
-                #if debug: print "H",H
-                #if debug: print "looping through subsets:",list(subsets(H,q+1))
-                for J in subsets(H,q+1):
-                    #if debug: print "Hand to opponent: ",J
-                    for K in subsets(J):
-                        if len(K)==0:
-                            continue # ignore the empty set
-                        new_vertices=Z.union(*K)
-                        #if debug: print "Opponent hands back: ",K, "so we have vertices",new_vertices
-                        # we don't have to do the empty subset, but it is simpler to just include it
-                        X=set(playzerosgame(G.subgraph(new_vertices),initial_set=Z))
-                        #if debug: print "X, ZFS on opponent's return: ",X
-                        if X not in L:
-                            #if debug: print "X not in L"
-                            break # go to next J
-                        #if debug: print "X is in L"
-                    else:
-                        L.add(Z)
-                        if sizeZ<zero_forcing_number:
-                            lastZ=Z
-                            zero_forcing_number=sizeZ
-                        break # next Z
-        #print zero_forcing_number, sizeZ
-        if zero_forcing_number>sizeZ: # we are done
-            return zero_forcing_number, lastZ
-
-from sage.all import Subsets, Set
-def Z_sage(G,q):
-
-    n=G.order()
-    V=Set(G.vertices())
-    if not G.is_connected():
-        raise ValueError("G needs to be connected")
-    if n<2:
-        raise ValueError("G needs to have 2 or more vertices")
-       
-    L=set(Subsets(V,n))
-    L|=set(Subsets(V,n-1))
-    lastZ=V
-    debug=False
-    for sizeZ in range(n-2,0,-1):
-        #print "Exploring size",sizeZ
-        for Z in Subsets(V, sizeZ):
-            W=Set(playzerosgame(G,initial_set=Z)) # find right command
-            #if debug: print "W",W
-            if W in L:
-                #if debug: print "W in L"
-                L.add(Z)
-                lastZ=Z
-                zero_forcing_number=sizeZ
-            else:
-                #if debug: print "W not in L"
-                H=[tuple(i) for i in G.subgraph(V-Z).connected_components()]
-                #if debug: print "H",H
-                #if debug: print "looping through subsets:",Subsets(H,q+1).list()
-                for J in Subsets(H,q+1):
-                    #if debug: print "Hand to opponent: ",J
-                    for K in Subsets(J):
-                        if len(K)==0:
-                            continue # ignore the empty set
-                        #if debug: print "Opponent hands back: ",K, "so we have vertices",Z+sum([Set(i) for i in K],Set([]))
-                        # we don't have to do the empty subset, but it is simpler to just include it
-                        X=Set(playzerosgame(G.subgraph(Z+Set(set([]).union(*K))),initial_set=Z))
-                        #if debug: print "X, ZFS on opponent's return: ",X
-                        if X not in L:
-                            #if debug: print "X not in L"
-                            break # go to next J
-                        #if debug: print "X is in L"
-                    else:
-                        L.add(Z)
-                        lastZ=Z
-                        zero_forcing_number=sizeZ
-                        break # next Z
-        #print zero_forcing_number, sizeZ
-        if zero_forcing_number>sizeZ: # we are done
-            return zero_forcing_number, lastZ
-'''
